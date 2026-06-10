@@ -1,0 +1,3 @@
+Plan: fix CSV generation to decode VI uint16 back to float [-1,1] before thresholding.
+Target code block exists in MainWindow._csv_generate and optionally VigorMLWindow._csv_generate.
+Edits pending due to edit_file ambiguity; need unique diff match strings or manual replacement by re-reading exact block and using that exact substring.

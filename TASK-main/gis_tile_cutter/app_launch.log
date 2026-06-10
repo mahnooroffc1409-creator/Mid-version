@@ -1,0 +1,2 @@
+C:\Users\mahno\Desktop\moiz test\TASK-main\gis_tile_cutter\main.py:1940: RuntimeWarning: invalid value encountered in cast
+  normed = np.clip((data - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)

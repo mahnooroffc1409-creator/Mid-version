@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "C:\Users\mahno\Desktop\moiz test\TASK-main\gis_tile_cutter\main.py", line 2356, in closeEvent
+    rows.append({
+    
+RuntimeError: wrapped C/C++ object of type TilingWorker has been deleted
+
