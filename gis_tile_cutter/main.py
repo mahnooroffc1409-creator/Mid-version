@@ -50,8 +50,9 @@ BAND_PATTERNS = [
     ("NIR",  [r"nir", r"near.?infrared", r"b5", r"band5", r"b8", r"band8"]),
     ("Red",  [r"red", r"b4", r"band4", r"r\b"]),
     ("Green",[r"green", r"b3", r"band3", r"g\b"]),
-    ("Blue", [r"blue", r"b2", r"band2", r"b\b"]),
+
     ("RedEdge", [r"rededge", r"re", r"b6", r"band6", r"b7", r"band7", r"b8a"]),
+    ("RGB",  [r"rgb"]),
     ("DEM",  [r"dem", r"dtm", r"elevation", r"height", r"dsm"]),
     ("SWIR1",[r"swir1", r"b11", r"band11"]),
     ("SWIR2",[r"swir2", r"b12", r"band12"]),
@@ -109,13 +110,13 @@ def compute_savi(nir: np.ndarray, red: np.ndarray, L=0.5) -> np.ndarray:
     return _clean_vi(result)
 
 
-def compute_grvi(nir: np.ndarray, green: np.ndarray) -> np.ndarray:
-    """GRVI = NIR / Green (ratio)"""
-    nir_f = nir.astype(float)
+def compute_grvi(green: np.ndarray, red: np.ndarray) -> np.ndarray:
+    """GRVI = (Green - Red) / (Green + Red)"""
     green_f = green.astype(float)
+    red_f = red.astype(float)
     with np.errstate(divide="ignore", invalid="ignore"):
-        result = nir_f / green_f
-    return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        result = (green_f - red_f) / (green_f + red_f)
+    return _clean_vi(result)
 
 
 def compute_wrdvi(nir: np.ndarray, red: np.ndarray, alpha=0.1) -> np.ndarray:
@@ -153,8 +154,8 @@ def compute_indices(bands: dict) -> dict[str, np.ndarray]:
         indices["SAVI"] = compute_savi(nir, red)
     if nir is not None and rededge is not None:
         indices["WDRVI"] = compute_wrdvi(nir, rededge)
-    if nir is not None and green is not None:
-        indices["GRVI"] = compute_grvi(nir, green)
+    if green is not None and red is not None:
+        indices["GRVI"] = compute_grvi(green, red)
     if nir is not None and red is not None:
         indices["FCOVER"] = compute_fcover(indices.get("NDVI", compute_ndvi(nir, red)))
     return indices
@@ -184,8 +185,8 @@ def compute_export_layers(bands: dict) -> dict[str, np.ndarray]:
         layers["RGB"] = compute_rgb(red, green, bands.get("Blue"))
     if nir is not None and green is not None:
         layers["GNDVI"] = compute_gndvi(nir, green)
-    if nir is not None and green is not None:
-        layers["GRVI"] = compute_grvi(nir, green)
+    if green is not None and red is not None:
+        layers["GRVI"] = compute_grvi(green, red)
     if nir is not None and red is not None:
         layers["WDRVI"] = compute_wrdvi(nir, red)
     if dem is not None:
@@ -922,45 +923,72 @@ def compute_tile_polys(aoi_geo: Polygon, tile_m: float, src_crs,
                         band_paths: dict | None = None,
                         band_indices: dict | None = None
                         ) -> list[Polygon]:
-    """Return tile box polygons in src_crs that intersect the AOI.
-    Uses UTM metric grid matching TilingWorker."""
-    aoi_bounds = aoi_geo.bounds
-    cx = (aoi_bounds[0] + aoi_bounds[2]) / 2
-    cy = (aoi_bounds[1] + aoi_bounds[3]) / 2
-    if not src_crs.is_geographic:
-        t = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+    """Return tile box polygons matching TilingWorker pixel-based grid."""
+    if not band_paths:
+        return []
+
+    ref_band = next((b for b in band_paths if b != "DEM"), next(iter(band_paths)))
+    try:
+        with rasterio.open(band_paths[ref_band]) as ref:
+            raster_transform = ref.transform
+            raster_width = ref.width
+            raster_height = ref.height
+            ref_crs = ref.crs
+    except Exception:
+        return []
+
+    aoi = aoi_geo
+    try:
+        common_bounds = None
+        for bpath in band_paths.values():
+            with rasterio.open(bpath) as src:
+                b = box(*src.bounds)
+                common_bounds = b if common_bounds is None else common_bounds.intersection(b)
+        if common_bounds is not None and not common_bounds.is_empty:
+            clipped = aoi.intersection(common_bounds)
+            if not clipped.is_empty:
+                aoi = clipped
+    except Exception:
+        pass
+
+    aoi_b = aoi.bounds
+    pixel_size_x = abs(raster_transform.a)
+    pixel_size_y = abs(raster_transform.e)
+
+    if ref_crs.is_geographic:
+        cx = (aoi_b[0] + aoi_b[2]) / 2
+        cy = (aoi_b[1] + aoi_b[3]) / 2
+        t = Transformer.from_crs(ref_crs, "EPSG:4326", always_xy=True)
         lon, lat = t.transform(cx, cy)
+        cos_lat = math.cos(math.radians(lat))
+        tile_deg_x = tile_m / (111320.0 * cos_lat)
+        tile_deg_y = tile_m / 111320.0
     else:
-        lon, lat = cx, cy
-    zone = int((lon + 180) / 6) + 1
-    hemi = 326 if lat >= 0 else 327
-    metric_crs = CRS.from_epsg(hemi * 100 + zone)
+        tile_deg_x = tile_deg_y = tile_m
 
-    t_fwd = Transformer.from_crs(src_crs, metric_crs, always_xy=True)
-    t_inv = Transformer.from_crs(metric_crs, src_crs, always_xy=True)
-    xs, ys = t_fwd.transform(
-        [aoi_bounds[0], aoi_bounds[2]],
-        [aoi_bounds[1], aoi_bounds[3]]
-    )
-    m_minx, m_maxx = min(xs), max(xs)
-    m_miny, m_maxy = min(ys), max(ys)
+    tile_width = max(int(round(tile_deg_x / pixel_size_x)), 1)
+    tile_height = max(int(round(tile_deg_y / pixel_size_y)), 1)
 
-    stride = tile_m
-    cols = math.ceil((m_maxx - m_minx - tile_m) / stride) + 1
-    rows = math.ceil((m_maxy - m_miny - tile_m) / stride) + 1
+    win_aoi = from_bounds(aoi_b[0], aoi_b[1], aoi_b[2], aoi_b[3], raster_transform)
+
+    p_start_col = max(0, int(math.floor(win_aoi.col_off)))
+    p_start_row = max(0, int(math.floor(win_aoi.row_off)))
+    p_end_col = min(raster_width, int(math.ceil(win_aoi.col_off + win_aoi.width)))
+    p_end_row = min(raster_height, int(math.ceil(win_aoi.row_off + win_aoi.height)))
+
+    tile_start_col = (p_start_col // tile_width) * tile_width
+    tile_start_row = (p_start_row // tile_height) * tile_height
+
     polys = []
-    for r in range(rows):
-        for c in range(cols):
-            t_minx = m_minx + c * stride
-            t_miny = m_miny + r * stride
-            t_maxx = min(t_minx + tile_m, m_minx + (cols - 1) * stride + tile_m)
-            t_maxy = min(t_miny + tile_m, m_miny + (rows - 1) * stride + tile_m)
-            xs2, ys2 = t_inv.transform(
-                [t_minx, t_maxx], [t_miny, t_maxy])
-            s_minx, s_maxx = min(xs2), max(xs2)
-            s_miny, s_maxy = min(ys2), max(ys2)
-            tile_box = box(s_minx, s_miny, s_maxx, s_maxy)
-            if aoi_geo.intersects(tile_box):
+    for row in range(tile_start_row, p_end_row, tile_height):
+        for col in range(tile_start_col, p_end_col, tile_width):
+            tw = min(tile_width, raster_width - col)
+            th = min(tile_height, raster_height - row)
+            if tw < 1 or th < 1:
+                continue
+            geo_bounds = rasterio.windows.bounds(Window(col, row, tw, th), raster_transform)
+            tile_box = box(*geo_bounds)
+            if aoi.intersects(tile_box):
                 polys.append(tile_box)
     return polys
 
@@ -1046,12 +1074,13 @@ class TilingWorker(QThread):
                 cy = (aoi_b[1] + aoi_b[3]) / 2
                 t = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
                 lon, lat = t.transform(cx, cy)
-                m_per_deg = 111320.0 * math.cos(math.radians(lat))
-                tile_m = self.tile_m / m_per_deg
+                cos_lat = math.cos(math.radians(lat))
+                tile_deg_x = self.tile_m / (111320.0 * cos_lat)
+                tile_deg_y = self.tile_m / 111320.0
             else:
-                tile_m = self.tile_m
-            tile_width = max(int(round(tile_m / pixel_size_x)), 1)
-            tile_height = max(int(round(tile_m / pixel_size_y)), 1)
+                tile_deg_x = tile_deg_y = self.tile_m
+            tile_width = max(int(round(tile_deg_x / pixel_size_x)), 1)
+            tile_height = max(int(round(tile_deg_y / pixel_size_y)), 1)
 
             # v1 pixel grid: align tile starts to file origin
             win_aoi = from_bounds(aoi_b[0], aoi_b[1], aoi_b[2], aoi_b[3], raster_transform)
@@ -1114,32 +1143,44 @@ class TilingWorker(QThread):
                 tile_meta = {}
                 for bname, bpath in self.band_paths.items():
                     band_idx = self.band_indices.get(bname, 1)
+                    is_rgb = (bname == "RGB")
                     try:
                         with rasterio.open(bpath) as src:
-                            # Convert pixel window to geographic bounds for this file
                             tile_bounds = rasterio.windows.bounds(
                                 Window(px_col, px_row, tw, th), raster_transform)
                             b_win = from_bounds(*tile_bounds, src.transform)
                             b_win = b_win.round_offsets().round_shape()
                             b_win = b_win.intersection(Window(0, 0, src.width, src.height))
                             if b_win.width >= 1 and b_win.height >= 1:
-                                raw = src.read(band_idx, window=b_win)
+                                raw = src.read(window=b_win) if is_rgb else src.read(band_idx, window=b_win)
                                 orig_dtype = raw.dtype
                                 expected_h = max(1, int(round(b_win.height)))
                                 expected_w = max(1, int(round(b_win.width)))
-                                if raw.shape != (expected_h, expected_w):
-                                    full = np.full((expected_h, expected_w), np.nan, dtype=np.float32)
-                                    rh = min(raw.shape[0], expected_h)
-                                    rw = min(raw.shape[1], expected_w)
-                                    full[:rh, :rw] = raw[:rh, :rw].astype(np.float32)
-                                    raw = full
+                                exp_shape = (3, expected_h, expected_w) if is_rgb else (expected_h, expected_w)
+                                if raw.shape != exp_shape:
+                                    if is_rgb:
+                                        full = np.full((3, expected_h, expected_w), np.nan, dtype=np.float32)
+                                        ch = min(raw.shape[0], 3) if raw.ndim == 3 else 1
+                                        rh = min(raw.shape[-2], expected_h)
+                                        rw = min(raw.shape[-1], expected_w)
+                                        full[:ch, :rh, :rw] = raw[:ch, :rh, :rw].astype(np.float32) if raw.ndim == 3 else raw[:rh, :rw].astype(np.float32)[np.newaxis, ...]
+                                        raw = full
+                                    else:
+                                        full = np.full((expected_h, expected_w), np.nan, dtype=np.float32)
+                                        rh = min(raw.shape[0], expected_h)
+                                        rw = min(raw.shape[1], expected_w)
+                                        full[:rh, :rw] = raw[:rh, :rw].astype(np.float32)
+                                        raw = full
                             else:
                                 orig_dtype = src.dtypes[0] if src.dtypes else np.float32
-                                raw = np.full((1, 1), np.nan, dtype=np.float32)
+                                raw = np.full((3, 1, 1), np.nan, dtype=np.float32) if is_rgb else np.full((1, 1), np.nan, dtype=np.float32)
                             nodata_val = src.nodata
                             data_float = raw if raw.dtype == np.float32 else raw.astype(np.float32)
                             if nodata_val is not None and not np.isnan(nodata_val):
-                                data_float[data_float == nodata_val] = np.nan
+                                if is_rgb:
+                                    data_float[data_float == nodata_val] = np.nan
+                                else:
+                                    data_float[data_float == nodata_val] = np.nan
                             tile_bands[bname] = data_float
                             tile_meta[bname] = (orig_dtype, nodata_val)
                     except Exception as e:
@@ -1161,21 +1202,15 @@ class TilingWorker(QThread):
                     out_path = layer_dir / f"tile_{fname}.tif"
 
                     if layer == "RGB":
-                        red = tile_bands.get("Red")
-                        green = tile_bands.get("Green")
-                        blue = tile_bands.get("Blue")
-                        if red is not None and green is not None:
-                            if blue is None:
-                                blue = green
-                            red = np.where(np.isnan(red), 0, red)
-                            green = np.where(np.isnan(green), 0, green)
-                            blue = np.where(np.isnan(blue), 0, blue)
+                        rgb = tile_bands.get("RGB")
+                        if rgb is not None:
+                            rgb = np.where(np.isnan(rgb), 0, rgb)
                             def _norm(b):
                                 bmin, bmax = b.min(), b.max()
                                 if bmax == bmin:
                                     return np.zeros_like(b, dtype=np.uint8)
                                 return ((b - bmin) / (bmax - bmin) * 255).astype(np.uint8)
-                            stacked = np.stack([_norm(red), _norm(green), _norm(blue)])
+                            stacked = np.stack([_norm(rgb[0]), _norm(rgb[1]), _norm(rgb[2])])
                             profile = {
                                 "driver": "GTiff", "count": 3,
                                 "width": tw, "height": th,
@@ -1201,16 +1236,16 @@ class TilingWorker(QThread):
                                                    tags={"VI_FORMULA": "GNDVI", "VI_RANGE_MIN": "-1", "VI_RANGE_MAX": "1"})
 
                     elif layer == "GRVI":
-                        nir = tile_bands.get("NIR")
                         green = tile_bands.get("Green")
-                        if nir is not None and green is not None:
-                            h = min(nir.shape[0], green.shape[0])
-                            w = min(nir.shape[1], green.shape[1])
-                            arr = compute_grvi(nir[:h, :w], green[:h, :w])
+                        red = tile_bands.get("Red")
+                        if green is not None and red is not None:
+                            h = min(green.shape[0], red.shape[0])
+                            w = min(green.shape[1], red.shape[1])
+                            arr = compute_grvi(green[:h, :w], red[:h, :w])
                             vi_f32 = arr.astype(np.float32)
                             self._write_tile_window(vi_f32, out_path, out_transform, src_crs,
                                                    dtype_override="float32",
-                                                   tags={"VI_FORMULA": "GRVI", "VI_RANGE_MIN": "0", "VI_RANGE_MAX": "inf"})
+                                                   tags={"VI_FORMULA": "GRVI", "VI_RANGE_MIN": "-1", "VI_RANGE_MAX": "1"})
 
                     elif layer == "WDRVI":
                         nir = tile_bands.get("NIR")
@@ -1247,24 +1282,25 @@ class TilingWorker(QThread):
                 tile_bounds = rasterio.windows.bounds(
                     Window(px_col, px_row, tw, th), raster_transform)
                 for bname, data_float in tile_bands.items():
-                    if data_float is not None:
-                        orig_dtype, orig_nodata = tile_meta.get(bname, (np.float32, None))
-                        # Compute transform matching this band's data array shape
-                        band_transform = transform_from_bounds(
-                            *tile_bounds, data_float.shape[1], data_float.shape[0])
-                        has_nan = np.isnan(data_float).any()
-                        fname = self._tile_filename(r_idx, c_idx, band_label=bname)
-                        if has_nan:
-                            if np.issubdtype(orig_dtype, np.integer):
-                                fill = orig_nodata if orig_nodata is not None else 0
-                                out_data = np.where(np.isnan(data_float), fill, data_float).astype(orig_dtype)
-                                self._write_tile_window(out_data, band_dir / f"tile_{fname}.tif", band_transform, src_crs, dtype_override=orig_dtype.name, nodata_override=fill if isinstance(fill, (int, float)) else None)
-                            else:
-                                out_data = np.where(np.isnan(data_float), 0, data_float).astype(np.float32)
-                                self._write_tile_window(out_data, band_dir / f"tile_{fname}.tif", band_transform, src_crs)
+                    if bname == "RGB" or data_float is None:
+                        continue
+                    orig_dtype, orig_nodata = tile_meta.get(bname, (np.float32, None))
+                    # Compute transform matching this band's data array shape
+                    band_transform = transform_from_bounds(
+                        *tile_bounds, data_float.shape[1], data_float.shape[0])
+                    has_nan = np.isnan(data_float).any()
+                    fname = self._tile_filename(r_idx, c_idx, band_label=bname)
+                    if has_nan:
+                        if np.issubdtype(orig_dtype, np.integer):
+                            fill = orig_nodata if orig_nodata is not None else 0
+                            out_data = np.where(np.isnan(data_float), fill, data_float).astype(orig_dtype)
+                            self._write_tile_window(out_data, band_dir / f"tile_{fname}.tif", band_transform, src_crs, dtype_override=orig_dtype.name, nodata_override=fill if isinstance(fill, (int, float)) else None)
                         else:
-                            out_data = data_float.astype(orig_dtype) if orig_dtype != np.float32 else data_float
-                            self._write_tile_window(out_data, band_dir / f"tile_{fname}.tif", band_transform, src_crs, dtype_override=orig_dtype.name if orig_dtype != np.float32 else None, nodata_override=orig_nodata)
+                            out_data = np.where(np.isnan(data_float), 0, data_float).astype(np.float32)
+                            self._write_tile_window(out_data, band_dir / f"tile_{fname}.tif", band_transform, src_crs)
+                    else:
+                        out_data = data_float.astype(orig_dtype) if orig_dtype != np.float32 else data_float
+                        self._write_tile_window(out_data, band_dir / f"tile_{fname}.tif", band_transform, src_crs, dtype_override=orig_dtype.name if orig_dtype != np.float32 else None, nodata_override=orig_nodata)
 
             geojson = {
                 "type": "FeatureCollection",
@@ -1370,12 +1406,12 @@ class MainWindow(QMainWindow):
             self.band_widgets[bname] = edit
 
         band_defs = [
+            ("RGB",    "#ff99cc"),
             ("Red",    "#e74c3c"),
             ("Green",  "#27ae60"),
             ("NIR",    "#e67e22"),
             ("RedEdge","#f0a23a"),
             ("DEM",    "#5eb8f0"),
-            ("Blue",   "#4a90d9"),
         ]
         for bname, colour in band_defs:
             _make_band_row(bname, colour)
@@ -1386,7 +1422,7 @@ class MainWindow(QMainWindow):
         # Manual band addition
         manual_row = QHBoxLayout()
         self._manual_band_combo = QComboBox()
-        self._manual_band_combo.addItems(["Red", "Green", "NIR", "RedEdge", "DEM", "Blue"])
+        self._manual_band_combo.addItems(["Red", "Green", "NIR", "RedEdge", "DEM", "RGB"])
         self._manual_band_combo.setFixedWidth(70)
         self._manual_path_edit = QLineEdit()
         self._manual_path_edit.setPlaceholderText("Select file...")
@@ -1750,6 +1786,20 @@ class MainWindow(QMainWindow):
         if not detected:
             self.log_msg(f"Could not detect band type: {fname}", C_WARN)
             return
+        if detected == "RGB":
+            if "RGB" in self.band_paths:
+                self.log_msg("RGB band already loaded", C_WARN)
+                return
+            self.band_paths["RGB"] = path
+            self.band_indices["RGB"] = 1
+            if "RGB" in self.band_widgets:
+                self.band_widgets["RGB"].setText(fname)
+                self.band_widgets["RGB"].setToolTip(path)
+            self.log_msg(f"Loaded RGB: {fname} (3-band)", C_ACCENT2)
+            self._validate_crs()
+            self._populate_band_selector()
+            self._load_preview(path, band_index=1)
+            return
         if detected in self.band_paths:
             self.log_msg(f"{detected} already loaded", C_WARN)
             return
@@ -1782,6 +1832,15 @@ class MainWindow(QMainWindow):
                 file_info.append((fname, fpath, detected))
         # Second pass: for multi-band files, assign sequential indices
         for fname, fpath, detected in file_info:
+            if detected == "RGB":
+                self.band_paths["RGB"] = fpath
+                self.band_indices["RGB"] = 1
+                if "RGB" in self.band_widgets:
+                    self.band_widgets["RGB"].setText(fname)
+                    self.band_widgets["RGB"].setToolTip(fpath)
+                found += 1
+                self.log_msg(f"Auto-detected RGB: {fname} (3-band)", C_ACCENT2)
+                continue
             if detected in self.band_paths:
                 self.log_msg(f"{detected} already loaded (from {Path(self.band_paths[detected]).name})", C_WARN)
                 continue
@@ -1799,65 +1858,36 @@ class MainWindow(QMainWindow):
             return
         self._validate_crs()
         self._populate_band_selector()
-        for bname in ["NIR", "Red", "Green", "DEM", "Blue", "RedEdge"]:
+        for bname in ["NIR", "Red", "Green", "DEM", "RedEdge"]:
             if bname in self.band_paths:
                 self._load_preview(self.band_paths[bname])
                 break
 
-    def _load_rgb_tiff(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select 3-band RGB GeoTIFF",
-            "", "GeoTIFF (*.tif *.tiff);;All files (*)")
-        if not path:
+    def _load_rgb_tiff(self, path=None):
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(self, "Select 3-band RGB GeoTIFF",
+                "", "GeoTIFF (*.tif *.tiff);;All files (*)")
+            if not path:
+                return
+        if "RGB" in self.band_paths:
+            self.log_msg("RGB band already loaded", C_WARN)
             return
         try:
             with rasterio.open(path) as ds:
                 if ds.count < 3:
-                    QMessageBox.warning(self, "Invalid bands",
-                        f"File has only {ds.count} band(s). Expected at least 3.")
+                    self.log_msg(f"RGB file has only {ds.count} band(s), expected 3", C_WARN)
                     return
-                for idx, bname in [(1, "Red"), (2, "Green"), (3, "Blue")]:
-                    self.band_paths[bname] = path
-                    self.band_indices[bname] = idx
-                    if bname in self.band_widgets:
-                        self.band_widgets[bname].setText(f"{Path(path).name} (b{idx})")
-                        self.band_widgets[bname].setToolTip(path)
-                    self.log_msg(f"Loaded {bname} (band {idx}): {path}", C_ACCENT2)
+                self.band_paths["RGB"] = path
+                self.band_indices["RGB"] = 1
+                if "RGB" in self.band_widgets:
+                    self.band_widgets["RGB"].setText(Path(path).name)
+                    self.band_widgets["RGB"].setToolTip(path)
+                self.log_msg(f"Loaded RGB: {Path(path).name} (3-band)", C_ACCENT2)
                 self._validate_crs()
                 self._populate_band_selector()
-                self.load_pbar.setVisible(True)
-                self.load_pbar.setValue(20)
-                QApplication.processEvents()
-                w, h, crs = ds.width, ds.height, ds.crs
-                left, bottom, right, top = ds.bounds
-                max_dim = 1024
-                scale = min(max_dim / w, max_dim / h, 1.0)
-                ow = max(int(w * scale), 1)
-                oh = max(int(h * scale), 1)
-                r = ds.read(1, out_shape=(oh, ow), resampling=Resampling.average)
-                g = ds.read(2, out_shape=(oh, ow), resampling=Resampling.average)
-                b = ds.read(3, out_shape=(oh, ow), resampling=Resampling.average)
-                self.load_pbar.setValue(60)
-                def _norm(band):
-                    v = band.astype(float)
-                    lo, hi = np.nanpercentile(v, 2), np.nanpercentile(v, 98)
-                    if hi == lo:
-                        return np.zeros_like(v, dtype=np.uint8)
-                    return np.clip((v - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
-                rn, gn, bn = _norm(r), _norm(g), _norm(b)
-                rgba = np.stack([rn, gn, bn, np.full((oh, ow), 255, dtype=np.uint8)], axis=-1)
-                img = QImage(rgba.tobytes(), ow, oh, ow * 4, QImage.Format.Format_RGBA8888)
-                pix = QPixmap.fromImage(img)
-                self.load_pbar.setValue(100)
-                self.canvas.load_overview(pix, (left, bottom, right, top), crs)
-                self.load_pbar.setVisible(False)
-                self._raster_crs = crs
-                self._raster_bounds = (left, bottom, right, top)
-                epsg = crs.to_epsg() if crs else None
-                self.crs_label.setText(f"CRS: EPSG:{epsg}" if epsg else f"CRS: {crs}"[:40])
-                self.status(f"Loaded RGB -- {w}x{h}  {self.crs_label.text()}")
+                self._load_preview(path, band_index=1)
         except Exception as e:
-            self.load_pbar.setVisible(False)
-            QMessageBox.critical(self, "Error", f"Failed to load RGB file:\n{e}")
+            self.log_msg(f"Failed to load RGB file: {e}", C_ERR)
 
     def _load_preview(self, path, band_index=1):
         if self._loader and self._loader.isRunning():
@@ -1884,10 +1914,9 @@ class MainWindow(QMainWindow):
         current = self.band_selector.currentText()
         self.band_selector.blockSignals(True)
         self.band_selector.clear()
-        has_rgb = all(b in self.band_paths for b in ("Red", "Green", "Blue"))
-        if has_rgb:
+        if "RGB" in self.band_paths:
             self.band_selector.addItem("RGB")
-        order = ["Red", "Green", "Blue", "NIR", "RedEdge", "DEM"]
+        order = ["Red", "Green", "NIR", "RedEdge", "DEM"]
         for b in order:
             if b in self.band_paths:
                 self.band_selector.addItem(b)
@@ -1906,24 +1935,20 @@ class MainWindow(QMainWindow):
             self._load_preview(self.band_paths[name], self.band_indices.get(name, 1))
 
     def _load_rgb_preview(self):
-        rpath = self.band_paths.get("Red")
-        gpath = self.band_paths.get("Green")
-        bpath = self.band_paths.get("Blue")
-        if not rpath or not gpath or not bpath:
+        path = self.band_paths.get("RGB")
+        if not path:
             return
         try:
-            with rasterio.open(rpath) as ds:
+            with rasterio.open(path) as ds:
                 w, h, crs = ds.width, ds.height, ds.crs
                 left, bottom, right, top = ds.bounds
                 max_dim = 1024
                 scale = min(max_dim / w, max_dim / h, 1.0)
                 ow = max(int(w * scale), 1)
                 oh = max(int(h * scale), 1)
-                r = ds.read(self.band_indices.get("Red", 1), out_shape=(oh, ow), resampling=Resampling.average)
-            with rasterio.open(gpath) as ds:
-                g = ds.read(self.band_indices.get("Green", 1), out_shape=(oh, ow), resampling=Resampling.average)
-            with rasterio.open(bpath) as ds:
-                b = ds.read(self.band_indices.get("Blue", 1), out_shape=(oh, ow), resampling=Resampling.average)
+                r = ds.read(1, out_shape=(oh, ow), resampling=Resampling.average)
+                g = ds.read(2, out_shape=(oh, ow), resampling=Resampling.average)
+                b = ds.read(3, out_shape=(oh, ow), resampling=Resampling.average)
             def _norm(band):
                 v = band.astype(float)
                 lo, hi = np.nanpercentile(v, 2), np.nanpercentile(v, 98)
@@ -2219,6 +2244,7 @@ class MainWindow(QMainWindow):
             band_paths  = self.band_paths,
             aoi_geo     = self.canvas.aoi_geo,
             output_dir  = out_dir,
+            src_crs     = self._raster_crs,
         )
         self._extract_worker.progress.connect(self._on_extract_progress)
         self._extract_worker.done.connect(self._on_extract_done)
@@ -2407,26 +2433,43 @@ class ExtractWorker(QThread):
     done = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, band_paths=None, aoi_geo=None, output_dir=""):
+    def __init__(self, band_paths=None, aoi_geo=None, output_dir="", src_crs=None):
         super().__init__()
         self.band_paths = band_paths or {}
         self.aoi_geo = aoi_geo
         self.output_dir = output_dir
+        self.src_crs = src_crs
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
 
+    def _aoi_for_crs(self, dst_crs):
+        if self.src_crs is None or self.src_crs == dst_crs:
+            return self.aoi_geo
+        t = Transformer.from_crs(self.src_crs, dst_crs, always_xy=True)
+        xs, ys = t.transform(*zip(*self.aoi_geo.exterior.coords))
+        return Polygon(list(zip(xs, ys)))
+
     def run(self):
         try:
             out = Path(self.output_dir)
             out.mkdir(parents=True, exist_ok=True)
+
+            raw_data: dict[str, tuple[np.ndarray, dict]] = {}
+            ref_profile = None
+            total_bands = len(self.band_paths)
+            total_steps = total_bands + 4  # + GNDVI, GRVI, WRDVI, RGB
+
+            # Phase 1: read & export raw bands
             for idx, (bname, bpath) in enumerate(self.band_paths.items()):
                 if self._cancelled:
                     return
-                self.progress.emit(int((idx + 1) / len(self.band_paths) * 100), f"Clipping {bname}…")
+                pct = int((idx + 1) / total_steps * 100)
+                self.progress.emit(pct, f"Clipping {bname}…")
                 with rasterio.open(bpath) as src:
-                    out_img, out_transform = rasterio_mask(src, [self.aoi_geo], crop=True, nodata=src.nodata)
+                    aoi_use = self._aoi_for_crs(src.crs)
+                    out_img, out_transform = rasterio_mask(src, [aoi_use], crop=True, nodata=src.nodata)
                     profile = src.profile.copy()
                     profile.update({
                         "height": out_img.shape[1],
@@ -2437,6 +2480,134 @@ class ExtractWorker(QThread):
                     dst_path = out / f"{bname}_aoi.tif"
                     with rasterio.open(str(dst_path), "w", **profile) as dst:
                         dst.write(out_img)
+                    raw_data[bname] = (out_img, profile)
+                    if ref_profile is None and bname not in ("DEM", "RGB"):
+                        ref_profile = profile
+
+            if ref_profile is None:
+                self.done.emit(str(out))
+                return
+
+            nd_val = -9999.0
+            crs = ref_profile["crs"]
+            transform = ref_profile["transform"]
+
+            def _get_band_2d(bname):
+                entry = raw_data.get(bname)
+                if entry is None:
+                    return None
+                arr, _ = entry
+                band = arr[0].astype(float)  # 2D array
+                nodata_val = arr[0].dtype.type(-65535) if arr.dtype.kind == 'f' else np.float32(-65535)
+                band[band == nodata_val] = np.nan
+                return band
+
+            nir = _get_band_2d("NIR")
+            green = _get_band_2d("Green")
+            red = _get_band_2d("Red")
+            dem_entry = raw_data.get("DEM")
+
+            # Determine common H,W for spectral bands
+            h = w = None
+            for b in [b for b in (nir, green, red) if b is not None]:
+                if h is None:
+                    h, w = b.shape
+                else:
+                    h = min(h, b.shape[0])
+                    w = min(w, b.shape[1])
+
+            if h is None or w is None:
+                self.done.emit(str(out))
+                return
+
+            def _crop(b):
+                return b[:h, :w] if b is not None else None
+
+            nir = _crop(nir)
+            green = _crop(green)
+            red = _crop(red)
+
+            vi_profile = {
+                "driver": "GTiff",
+                "height": h,
+                "width": w,
+                "count": 1,
+                "dtype": "float32",
+                "crs": crs,
+                "transform": transform,
+                "compress": "lzw",
+                "nodata": nd_val,
+            }
+
+            step = total_bands
+
+            # GNDVI
+            if nir is not None and green is not None:
+                step += 1
+                self.progress.emit(int(step / total_steps * 100), "Writing GNDVI…")
+                gndvi = compute_gndvi(nir, green)
+                gndvi[np.isnan(gndvi)] = nd_val
+                with rasterio.open(str(out / "GNDVI_aoi.tif"), "w", **vi_profile) as dst:
+                    dst.write(gndvi, 1)
+
+            # GRVI
+            if green is not None and red is not None:
+                step += 1
+                self.progress.emit(int(step / total_steps * 100), "Writing GRVI…")
+                grvi = compute_grvi(green, red)
+                grvi[np.isnan(grvi)] = nd_val
+                with rasterio.open(str(out / "GRVI_aoi.tif"), "w", **vi_profile) as dst:
+                    dst.write(grvi, 1)
+
+            # WRDVI
+            if nir is not None and red is not None:
+                step += 1
+                self.progress.emit(int(step / total_steps * 100), "Writing WRDVI…")
+                wrdvi = compute_wrdvi(nir, red)
+                wrdvi[np.isnan(wrdvi)] = nd_val
+                with rasterio.open(str(out / "WRDVI_aoi.tif"), "w", **vi_profile) as dst:
+                    dst.write(wrdvi, 1)
+
+            # RGB
+            rgb_entry = raw_data.get("RGB")
+            if rgb_entry is not None:
+                step += 1
+                self.progress.emit(int(step / total_steps * 100), "Writing RGB…")
+                rgb_arr, rgb_prof = rgb_entry
+                rgb_arr = rgb_arr.astype(float)
+                nd = rgb_prof.get("nodata")
+                if nd is not None:
+                    rgb_arr[rgb_arr == nd] = np.nan
+                rgb_norm = np.zeros_like(rgb_arr, dtype=np.uint8)
+                for bi in range(min(rgb_arr.shape[0], 3)):
+                    band = rgb_arr[bi]
+                    band_nonan = np.where(np.isnan(band), 0, band)
+                    bmin, bmax = band_nonan.min(), band_nonan.max()
+                    if bmax > bmin:
+                        rgb_norm[bi] = ((band_nonan - bmin) / (bmax - bmin) * 255).astype(np.uint8)
+                rgb_profile = {**rgb_prof, "count": 3, "dtype": "uint8"}
+                rgb_profile.pop("nodata", None)
+                with rasterio.open(str(out / "RGB_aoi.tif"), "w", **rgb_profile) as dst:
+                    dst.write(rgb_norm)
+            elif red is not None and green is not None:
+                step += 1
+                self.progress.emit(int(step / total_steps * 100), "Writing RGB…")
+                r = red.copy().astype(float)
+                g2 = green.copy().astype(float)
+                b2 = g2.copy()
+                for band in (r, g2, b2):
+                    band[np.isnan(band)] = 0
+                def _norm(band):
+                    bmin, bmax = band.min(), band.max()
+                    if bmax == bmin:
+                        return np.zeros_like(band, dtype=np.uint8)
+                    return ((band - bmin) / (bmax - bmin) * 255).astype(np.uint8)
+                rgb = np.stack([_norm(r), _norm(g2), _norm(b2)])
+                rgb_profile = {**vi_profile, "count": 3, "dtype": "uint8"}
+                rgb_profile.pop("nodata", None)
+                with rasterio.open(str(out / "RGB_aoi.tif"), "w", **rgb_profile) as dst:
+                    dst.write(rgb)
+
             self.done.emit(str(out))
         except Exception as e:
             self.error.emit(str(e))
