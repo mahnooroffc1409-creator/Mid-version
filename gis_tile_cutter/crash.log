@@ -1,6 +1,12 @@
 Traceback (most recent call last):
-  File "C:\Users\mahno\Desktop\moiz test\TASK-main\gis_tile_cutter\main.py", line 2356, in closeEvent
-    rows.append({
-    
-RuntimeError: wrapped C/C++ object of type TilingWorker has been deleted
+  File "C:\Users\mahno\Desktop\moiz test\TASK-main\gis_tile_cutter\main.py", line 750, in wheelEvent
+    self._rebuild_overlays()
+    ~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mahno\Desktop\moiz test\TASK-main\gis_tile_cutter\main.py", line 740, in _rebuild_overlays
+    self._rebuild_aoi_overlay()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mahno\Desktop\moiz test\TASK-main\gis_tile_cutter\main.py", line 537, in _rebuild_aoi_overlay
+    for x, y in self.aoi_geo.exterior.coords]
+                ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'MultiPolygon' object has no attribute 'exterior'
 

@@ -690,11 +690,8 @@ class MapCanvas(QWidget):
             self.update()
 
         if self.tool == self.TOOL_POLY:
-            if len(self._poly_pts) >= 3:
-                self.aoi_screen = list(self._poly_pts)
-                self._commit_aoi()
-                self._poly_pts = []
-                self.update()
+            # polygon commits on double-click only — see mouseDoubleClickEvent
+            pass
 
         if self.tool == self.TOOL_FREE and self._dragging_free:
             self._dragging_free = False
@@ -704,6 +701,15 @@ class MapCanvas(QWidget):
                 self._free_pts = []
                 self.update()
 
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self.tool == self.TOOL_POLY:
+            if len(self._poly_pts) >= 3:
+                self.aoi_screen = list(self._poly_pts)
+                self._commit_aoi()
+                self._poly_pts = []
+                self.update()
+            super().mouseDoubleClickEvent(e)
+
     def _commit_aoi(self):
         """Convert screen AOI to geographic coordinates."""
         geo_pts = []
@@ -712,7 +718,10 @@ class MapCanvas(QWidget):
             if lon is not None:
                 geo_pts.append((lon, lat))
         if len(geo_pts) >= 3:
-            self.aoi_geo = Polygon(geo_pts)
+            p = Polygon(geo_pts)
+            if not p.is_valid:
+                p = p.buffer(0)
+            self.aoi_geo = p
             self.aoi_changed.emit(self.aoi_geo)
 
     def clear_aoi(self):
@@ -752,6 +761,11 @@ class MapCanvas(QWidget):
             self.update()
         elif e.key() == Qt.Key.Key_Delete or e.key() == Qt.Key.Key_Backspace:
             self.clear_aoi()
+        elif (e.key() == Qt.Key.Key_Return or e.key() == Qt.Key.Key_Enter) and self.tool == self.TOOL_POLY and len(self._poly_pts) >= 3:
+            self.aoi_screen = list(self._poly_pts)
+            self._commit_aoi()
+            self._poly_pts = []
+            self.update()
         elif e.key() == Qt.Key.Key_Plus or e.key() == Qt.Key.Key_Equal:
             self.scale *= 1.25
             self._rebuild_overlays()
@@ -763,98 +777,6 @@ class MapCanvas(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Histogram Widget
-# ══════════════════════════════════════════════════════════════════════════════
-
-class HistogramWidget(QWidget):
-    """Simple histogram display."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumHeight(180)
-        self._data: list[np.ndarray] = []
-        self._labels: list[str] = []
-        self._colors: list[str] = []
-
-    def set_histogram(self, data: list[np.ndarray], labels: list[str], colors: list[str]):
-        self._data = data
-        self._labels = labels
-        self._colors = colors
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor(C_PANEL))
-        if not self._data:
-            p.setPen(QColor(C_MUTED))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No data")
-            return
-
-        margin = 40
-        pw = w - 2 * margin
-        ph = h - 2 * margin
-        bins = 100
-        bin_w = max(pw / bins, 1)
-
-        for idx, data in enumerate(self._data):
-            if data.size == 0:
-                continue
-            hist, edges = np.histogram(data, bins=bins)
-            if hist.max() == 0:
-                continue
-            hist_n = hist / hist.max()
-            p.setPen(QColor(self._colors[idx] if idx < len(self._colors) else C_ACCENT))
-            for i in range(bins):
-                x = margin + i * bin_w
-                bh = hist_n[i] * ph
-                p.drawLine(int(x), int(h - margin), int(x), int(h - margin - bh))
-
-    def minimumSizeHint(self):
-        return QSize(200, 180)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Band Info Widget
-# ══════════════════════════════════════════════════════════════════════════════
-
-class BandInfoWidget(QWidget):
-    """Display loaded band metadata."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._layout = QVBoxLayout(self)
-        self._layout.setSpacing(2)
-        self._labels = {}
-
-    def set_info(self, bands: dict):
-        for i in reversed(range(self._layout.count())):
-            item = self._layout.itemAt(i)
-            if item and item.widget():
-                item.widget().deleteLater()
-        self._labels = {}
-        if not bands:
-            self._layout.addWidget(QLabel("No bands loaded"))
-            return
-        for bname, bpath in bands.items():
-            try:
-                with rasterio.open(bpath) as ds:
-                    txt = (
-                        f"<b>{bname}</b><br>"
-                        f"  Path: {Path(bpath).name}<br>"
-                        f"  Size: {ds.width} x {ds.height}<br>"
-                        f"  CRS: {ds.crs}<br>"
-                        f"  Dtype: {ds.dtypes[0]}<br>"
-                        f"  Nodata: {ds.nodata}<br>"
-                        f"  Resolution: {abs(ds.res[0]):.4f}, {abs(ds.res[1]):.4f}"
-                    )
-            except Exception as e:
-                txt = f"<b>{bname}</b><br>  Error: {e}"
-            lbl = QLabel(txt)
-            lbl.setWordWrap(True)
-            lbl.setStyleSheet(f"color:{C_TEXT};font-size:11px;padding:4px;border-bottom:1px solid {C_BORDER};")
-            self._layout.addWidget(lbl)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # AOI Stats Widget
 # ══════════════════════════════════════════════════════════════════════════════
@@ -938,6 +860,8 @@ def compute_tile_polys(aoi_geo: Polygon, tile_m: float, src_crs,
         return []
 
     aoi = aoi_geo
+    if not aoi.is_valid:
+        aoi = aoi.buffer(0)
     try:
         common_bounds = None
         for bpath in band_paths.values():
@@ -1054,6 +978,8 @@ class TilingWorker(QThread):
                 raster_height = ref.height
 
             aoi = self.aoi_geo
+            if not aoi.is_valid:
+                aoi = aoi.buffer(0)
             common_bounds = None
             for bpath in self.band_paths.values():
                 with rasterio.open(bpath) as src:
@@ -1422,7 +1348,7 @@ class MainWindow(QMainWindow):
         # Manual band addition
         manual_row = QHBoxLayout()
         self._manual_band_combo = QComboBox()
-        self._manual_band_combo.addItems(["Red", "Green", "NIR", "RedEdge", "DEM", "RGB"])
+        self._manual_band_combo.addItems(["Red", "Green", "NIR", "RedEdge", "DEM"])
         self._manual_band_combo.setFixedWidth(70)
         self._manual_path_edit = QLineEdit()
         self._manual_path_edit.setPlaceholderText("Select file...")
@@ -1433,10 +1359,6 @@ class MainWindow(QMainWindow):
         manual_row.addWidget(self._manual_path_edit)
         manual_row.addWidget(manual_btn)
         bg_v.addLayout(manual_row)
-
-        upload_btn = QPushButton("Auto-detect from filename")
-        upload_btn.clicked.connect(self._upload_bands)
-        bg_v.addWidget(upload_btn)
 
         load_all_btn = QPushButton("Load all from folder")
         load_all_btn.clicked.connect(self._load_all_bands)
@@ -1475,7 +1397,6 @@ class MainWindow(QMainWindow):
             (MapCanvas.TOOL_RECT,  "Rect",   "Drag to draw a rectangle AOI"),
             (MapCanvas.TOOL_POLY,  "Poly",   "Click vertices, double-click or press Enter to close"),
             (MapCanvas.TOOL_FREE,  "Free",   "Freehand draw an AOI"),
-            (MapCanvas.TOOL_PAN,   "Pan",    "Pan the map view"),
         ]:
             b = QPushButton(icon)
             b.setCheckable(True)
@@ -1531,15 +1452,7 @@ class MainWindow(QMainWindow):
         self.tile_size_spin.setValue(3.5)
         self.tile_size_spin.setSingleStep(0.5)
         tg_grid.addWidget(self.tile_size_spin, 0, 1)
-        tg_grid.addWidget(QLabel("Edge handling:"), 1, 0)
-        self.edge_combo = QComboBox()
-        self.edge_combo.addItems(["discard", "zeros", "reflect"])
-        tg_grid.addWidget(self.edge_combo, 1, 1)
-        tg_grid.addWidget(QLabel("Tile naming:"), 2, 0)
-        self.naming_combo = QComboBox()
-        self.naming_combo.addItems(["rowcol", "geo coords", "timestamp"])
-        tg_grid.addWidget(self.naming_combo, 2, 1)
-        tg_grid.addWidget(QLabel("Output folder:"), 3, 0)
+        tg_grid.addWidget(QLabel("Output folder:"), 1, 0)
         out_row = QHBoxLayout()
         self.out_dir_edit = QLineEdit()
         self.out_dir_edit.setPlaceholderText("Choose folder…")
@@ -1557,19 +1470,6 @@ class MainWindow(QMainWindow):
         stats_v.addWidget(self.aoi_stats_widget)
         lv.addWidget(stats_group)
 
-        # Export Tiles
-        self.run_btn = QPushButton("Export Tiles")
-        self.run_btn.setObjectName("primary")
-        self.run_btn.setFixedHeight(38)
-        self.run_btn.clicked.connect(self._run_tiling)
-        lv.addWidget(self.run_btn)
-
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("danger")
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.clicked.connect(self._cancel_tiling)
-        lv.addWidget(self.cancel_btn)
-
         # Extract AOI
         extract_group = QGroupBox("Extract AOI")
         extract_v = QVBoxLayout(extract_group)
@@ -1586,11 +1486,23 @@ class MainWindow(QMainWindow):
         extract_v.addWidget(self.extract_cancel_btn)
         self.extract_pbar = QProgressBar()
         self.extract_pbar.setVisible(False)
-        extract_v.addWidget(self.extract_pbar)
         self.extract_lbl = QLabel("")
         self.extract_lbl.setObjectName("coord")
         extract_v.addWidget(self.extract_lbl)
         lv.addWidget(extract_group)
+
+        # Export Tiles
+        self.run_btn = QPushButton("Export Tiles")
+        self.run_btn.setObjectName("primary")
+        self.run_btn.setFixedHeight(38)
+        self.run_btn.clicked.connect(self._run_tiling)
+        lv.addWidget(self.run_btn)
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("danger")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self._cancel_tiling)
+        lv.addWidget(self.cancel_btn)
 
         # Vigor Analysis button
         self.vigor_btn = QPushButton("Vigor Analysis & ML")
@@ -1638,9 +1550,13 @@ class MainWindow(QMainWindow):
         self.pixel_val_lbl = QLabel("Value: —")
         self.pixel_val_lbl.setStyleSheet(f"color:{C_WARN};font-size:11px;font-family:monospace;")
         tb.addWidget(self.pixel_val_lbl)
-
         tb.addStretch()
-
+        self.pan_btn = QPushButton("Pan")
+        self.pan_btn.setCheckable(True)
+        self.pan_btn.setFixedWidth(60)
+        self.pan_btn.setToolTip("Pan the map view")
+        self.pan_btn.clicked.connect(lambda: self._set_tool(MapCanvas.TOOL_PAN))
+        tb.addWidget(self.pan_btn)
         self.show_aoi_cb = QCheckBox("AOI fill")
         self.show_aoi_cb.setChecked(False)
         self.show_aoi_cb.toggled.connect(lambda v: setattr(self.canvas, 'show_aoi_fill', v) or self.canvas.update())
@@ -1658,26 +1574,6 @@ class MainWindow(QMainWindow):
         map_v.addWidget(self.canvas)
         self.tabs.addTab(map_tab, "Map view")
 
-        # Histogram tab
-        hist_tab = QWidget()
-        hist_v = QVBoxLayout(hist_tab)
-        hist_v.setContentsMargins(8, 8, 8, 8)
-        self.histogram = HistogramWidget()
-        hist_v.addWidget(self.histogram)
-        self.hist_stats_lbl = QLabel("")
-        self.hist_stats_lbl.setStyleSheet(f"color:{C_TEXT};font-size:11px;font-family:monospace;")
-        self.hist_stats_lbl.setWordWrap(True)
-        hist_v.addWidget(self.hist_stats_lbl)
-        self.tabs.addTab(hist_tab, "Histogram")
-
-        # Band Info tab
-        info_tab = QWidget()
-        info_v = QVBoxLayout(info_tab)
-        info_v.setContentsMargins(8, 8, 8, 8)
-        self.band_info = BandInfoWidget()
-        info_v.addWidget(self.band_info)
-        self.tabs.addTab(info_tab, "Band Info")
-
         # Log tab
         log_tab = QWidget()
         log_v = QVBoxLayout(log_tab)
@@ -1687,32 +1583,12 @@ class MainWindow(QMainWindow):
         log_v.addWidget(self.log)
         self.tabs.addTab(log_tab, "Log")
 
-        # CSV Export tab (right-side) — parameters only
+        # CSV Export tab (right-side)
         csv_tab = QWidget()
         csv_v = QVBoxLayout(csv_tab)
         csv_v.setContentsMargins(8, 8, 8, 8)
         csv_v.setSpacing(6)
-
-        csv_v.addWidget(QLabel("<b>Thresholds:</b>"))
-        th_grid = QGridLayout()
-        th_grid.addWidget(QLabel("GNDVI:"), 0, 0); self.csv_gndvi_th = QDoubleSpinBox(); self.csv_gndvi_th.setRange(0,1); self.csv_gndvi_th.setValue(0.4); self.csv_gndvi_th.setSingleStep(0.05); th_grid.addWidget(self.csv_gndvi_th, 0, 1)
-        th_grid.addWidget(QLabel("GRVI:"), 1, 0);  self.csv_grvi_th = QDoubleSpinBox(); self.csv_grvi_th.setRange(0,1); self.csv_grvi_th.setValue(0.18); self.csv_grvi_th.setSingleStep(0.05); th_grid.addWidget(self.csv_grvi_th, 1, 1)
-        th_grid.addWidget(QLabel("WDRVI:"), 2, 0); self.csv_wdrvi_th = QDoubleSpinBox(); self.csv_wdrvi_th.setRange(0,1); self.csv_wdrvi_th.setValue(0.6); self.csv_wdrvi_th.setSingleStep(0.05); th_grid.addWidget(self.csv_wdrvi_th, 2, 1)
-        th_grid.addWidget(QLabel("DEM slope:"), 3, 0); self.csv_dem_slope = QDoubleSpinBox(); self.csv_dem_slope.setRange(-9999,9999); self.csv_dem_slope.setValue(67.637); th_grid.addWidget(self.csv_dem_slope, 3, 1)
-        th_grid.addWidget(QLabel("DEM intercept:"), 4, 0); self.csv_dem_inter = QDoubleSpinBox(); self.csv_dem_inter.setRange(-9999,9999); self.csv_dem_inter.setValue(47.947); th_grid.addWidget(self.csv_dem_inter, 4, 1)
-        csv_v.addLayout(th_grid)
-
-        csv_v.addWidget(QLabel("<b>HSV vegetation mask:</b>"))
-        hsv_g = QGroupBox()
-        hsv_l = QGridLayout(hsv_g)
-        hsv_l.addWidget(QLabel("H:"), 0, 0); self.csv_h_min = QSpinBox(); self.csv_h_min.setRange(0,179); self.csv_h_min.setValue(27); hsv_l.addWidget(self.csv_h_min, 0, 1)
-        hsv_l.addWidget(QLabel("to"), 0, 2); self.csv_h_max = QSpinBox(); self.csv_h_max.setRange(0,179); self.csv_h_max.setValue(90); hsv_l.addWidget(self.csv_h_max, 0, 3)
-        hsv_l.addWidget(QLabel("S:"), 1, 0); self.csv_s_min = QSpinBox(); self.csv_s_min.setRange(0,255); self.csv_s_min.setValue(27); hsv_l.addWidget(self.csv_s_min, 1, 1)
-        hsv_l.addWidget(QLabel("to"), 1, 2); self.csv_s_max = QSpinBox(); self.csv_s_max.setRange(0,255); self.csv_s_max.setValue(255); hsv_l.addWidget(self.csv_s_max, 1, 3)
-        hsv_l.addWidget(QLabel("V:"), 2, 0); self.csv_v_min = QSpinBox(); self.csv_v_min.setRange(0,255); self.csv_v_min.setValue(27); hsv_l.addWidget(self.csv_v_min, 2, 1)
-        hsv_l.addWidget(QLabel("to"), 2, 2); self.csv_v_max = QSpinBox(); self.csv_v_max.setRange(0,255); self.csv_v_max.setValue(255); hsv_l.addWidget(self.csv_v_max, 2, 3)
-        csv_v.addWidget(hsv_g)
-
+        csv_v.addWidget(QLabel("Thresholds and HSV parameters are fixed."))
         self.csv_result = QLabel("")
         csv_v.addWidget(self.csv_result)
         csv_v.addStretch()
@@ -1858,10 +1734,13 @@ class MainWindow(QMainWindow):
             return
         self._validate_crs()
         self._populate_band_selector()
-        for bname in ["NIR", "Red", "Green", "DEM", "RedEdge"]:
-            if bname in self.band_paths:
-                self._load_preview(self.band_paths[bname])
-                break
+        if "RGB" in self.band_paths:
+            self._load_rgb_preview()
+        else:
+            for bname in ["NIR", "Red", "Green", "DEM", "RedEdge"]:
+                if bname in self.band_paths:
+                    self._load_preview(self.band_paths[bname])
+                    break
 
     def _load_rgb_tiff(self, path=None):
         if path is None:
@@ -1960,6 +1839,14 @@ class MainWindow(QMainWindow):
             img = QImage(rgba.tobytes(), ow, oh, ow * 4, QImage.Format.Format_RGBA8888)
             pix = QPixmap.fromImage(img)
             self.canvas.load_overview(pix, (left, bottom, right, top), crs)
+            self._raster_crs = crs
+            self.raster_bounds = (left, bottom, right, top)
+            self._raster_bounds = self.raster_bounds
+            self._dataset_width = w
+            self._dataset_height = h
+            epsg = crs.to_epsg() if crs else None
+            self.crs_label.setText(f"CRS: EPSG:{epsg}" if epsg else f"CRS: {crs}"[:40])
+            self.log_msg(f"RGB preview: {Path(path).name}  |  {w}x{h} px  |  CRS: {crs}", C_ACCENT2)
         except Exception as e:
             self.log_msg(f"RGB preview error: {e}", C_ERR)
 
@@ -2002,7 +1889,13 @@ class MainWindow(QMainWindow):
     def _set_tool(self, tid):
         self.canvas.tool = tid
         self.canvas.setFocus()
-        # reset incomplete drawings
+        self.pan_btn.setChecked(tid == MapCanvas.TOOL_PAN)
+        if tid != MapCanvas.TOOL_PAN:
+            self._tool_group.setExclusive(False)
+            for b in self._tool_group.buttons():
+                b.setChecked(False)
+            self.tool_btns[tid].setChecked(True)
+            self._tool_group.setExclusive(True)
         self.canvas._rect_start = None
         self.canvas._rect_cur = None
         self.canvas._poly_pts = []
@@ -2011,6 +1904,28 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
     # ── AOI events ──
+    def _aoi_for_spectral(self, aoi_geo):
+        """Transform canvas AOI to spectral reference band CRS if needed."""
+        if aoi_geo is None:
+            return None
+        canvas_crs = self.canvas.raster_crs
+        if canvas_crs is None:
+            return aoi_geo
+        ref_band = next((b for b in self.band_paths if b not in ("DEM", "RGB")), next(iter(self.band_paths)))
+        try:
+            with rasterio.open(self.band_paths[ref_band]) as src:
+                ref_crs = src.crs
+        except Exception:
+            return aoi_geo
+        if canvas_crs == ref_crs:
+            return aoi_geo
+        try:
+            t = Transformer.from_crs(canvas_crs, ref_crs, always_xy=True)
+            xs, ys = t.transform(*zip(*aoi_geo.exterior.coords))
+            return Polygon(list(zip(xs, ys)))
+        except Exception:
+            return aoi_geo
+
     def _on_aoi_changed(self, aoi_geo):
         if aoi_geo is None:
             self.canvas.tile_geo = []
@@ -2021,9 +1936,10 @@ class MainWindow(QMainWindow):
             return
         try:
             tile_m = self.tile_size_spin.value()
-            polys = compute_tile_polys(aoi_geo, tile_m, self._raster_crs,
+            aoi_spec = self._aoi_for_spectral(aoi_geo)
+            polys = compute_tile_polys(aoi_spec, tile_m, self._raster_crs,
                                         band_paths=self.band_paths, band_indices=self.band_indices)
-            stats = compute_aoi_stats(aoi_geo, tile_m, self._raster_crs,
+            stats = compute_aoi_stats(aoi_spec, tile_m, self._raster_crs,
                                        band_paths=self.band_paths, band_indices=self.band_indices)
             self.canvas.set_tile_grid(polys)
             self.aoi_stats_widget.update_stats(stats)
@@ -2149,12 +2065,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No output", "Choose an output folder.")
             return
 
-        edge_map = {0: "discard", 1: "zeros", 2: "reflect"}
-        edge_handling = edge_map[self.edge_combo.currentIndex()]
-
-        naming_map = {0: "rowcol", 1: "geo", 2: "timestamp"}
-        tile_naming = naming_map[self.naming_combo.currentIndex()]
-
         layers = ["RGB", "GNDVI", "GRVI", "WDRVI", "DEM"]
 
         self.run_btn.setEnabled(False)
@@ -2167,16 +2077,17 @@ class MainWindow(QMainWindow):
             idx = self.band_indices.get(bname, 1)
             self.log_msg(f"  band [{bname}] = {Path(bpath).name} (index {idx})", C_ACCENT2)
 
+        aoi_use = self._aoi_for_spectral(self.canvas.aoi_geo)
         self._worker = TilingWorker(
             band_paths     = self.band_paths,
-            aoi_geo        = self.canvas.aoi_geo,
+            aoi_geo        = aoi_use,
             tile_m         = self.tile_size_spin.value(),
             output_dir     = out_dir,
             export_layers  = layers,
             overlap        = 0.0,
-            edge_handling  = edge_handling,
+            edge_handling  = "zeros",
             band_indices     = self.band_indices,
-            tile_naming    = tile_naming,
+            tile_naming    = "rowcol",
         )
         self._worker.progress.connect(self._on_tile_progress)
         self._worker.tile_done.connect(lambda p: self.log_msg(f"  + {Path(p).name}", C_ACCENT2))
@@ -2240,9 +2151,10 @@ class MainWindow(QMainWindow):
         self.extract_lbl.setText("Starting…")
         self.log_msg("--- AOI extract started ---", C_ACCENT)
 
+        aoi_use = self._aoi_for_spectral(self.canvas.aoi_geo)
         self._extract_worker = ExtractWorker(
             band_paths  = self.band_paths,
-            aoi_geo     = self.canvas.aoi_geo,
+            aoi_geo     = aoi_use,
             output_dir  = out_dir,
             src_crs     = self._raster_crs,
         )
@@ -2297,10 +2209,16 @@ class MainWindow(QMainWindow):
             return
         self.csv_gen_btn.setEnabled(False)
 
+        # Fixed parameters
+        vi_thresh_fixed = {"GNDVI": 0.4, "GRVI": 0.18, "WDRVI": 0.6}
+        dem_slope_fixed = 67.637
+        dem_inter_fixed = 47.947
+        hsv_min = (27, 27, 27)
+        hsv_max = (90, 255, 255)
+
         def tile_name(path):
             return Path(path).stem
 
-        # Collect all tile names from every subfolder
         all_tile_names = set()
         sub_dirs = [
             base / "DEM", base / "dem", base / "Dem",
@@ -2323,7 +2241,6 @@ class MainWindow(QMainWindow):
         self.csv_result.setText(f"Found {len(all_tile_names)} tiles in: {', '.join(found_dirs)}")
         QApplication.processEvents()
 
-        # ── DEM → Height ──
         self.csv_result.setText("Processing DEM…")
         QApplication.processEvents()
         height_dict = {}
@@ -2332,21 +2249,17 @@ class MainWindow(QMainWindow):
                 for p in d.glob("*.tif"):
                     try:
                         img = np.array(Image.open(p)).astype(float)
-                        cal = self.csv_dem_slope.value() * img.mean() + self.csv_dem_inter.value()
+                        cal = dem_slope_fixed * img.mean() + dem_inter_fixed
                         height_dict[tile_name(p)] = cal
                     except Exception:
                         continue
                 break
 
-        # ── Indices: GNDVI, GRVI, WDRVI ──
         self.csv_result.setText("Processing indices…")
         QApplication.processEvents()
         vi_dir_map = {"GNDVI": [base / "GNDVI", base / "gndvi"],
                       "GRVI":  [base / "GRVI",  base / "grvi"],
                       "WDRVI": [base / "WDRVI", base / "wdrvi", base / "WRDVI", base / "wrdvi"]}
-        vi_thresh = {"GNDVI": self.csv_gndvi_th.value(),
-                     "GRVI":  self.csv_grvi_th.value(),
-                     "WDRVI": self.csv_wdrvi_th.value()}
         vi_dicts = {k: {} for k in vi_dir_map}
         for label, dirs in vi_dir_map.items():
             for d in dirs:
@@ -2354,14 +2267,13 @@ class MainWindow(QMainWindow):
                     for p in d.glob("*.tif"):
                         try:
                             raw = np.array(Image.open(p)).astype(float)
-                            vi = (raw / 65535.0) * 2.0 - 1.0  # uint16 [0,65535] → float [-1,1]
-                            vals = vi[vi > vi_thresh[label]]
+                            vi = (raw / 65535.0) * 2.0 - 1.0
+                            vals = vi[vi > vi_thresh_fixed[label]]
                             vi_dicts[label][tile_name(p)] = vals.mean() if vals.size > 0 else ""
                         except Exception:
                             continue
                     break
 
-        # ── Optical → F Cover ──
         self.csv_result.setText("Processing Optical…")
         QApplication.processEvents()
         fcover_dict = {}
@@ -2376,9 +2288,7 @@ class MainWindow(QMainWindow):
                         black_pixels = np.sum(img == 0)
                         non_zero_pixels = total_pixels - black_pixels
                         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                        mask = cv2.inRange(hsv,
-                            (self.csv_h_min.value(), self.csv_s_min.value(), self.csv_v_min.value()),
-                            (self.csv_h_max.value(), self.csv_s_max.value(), self.csv_v_max.value()))
+                        mask = cv2.inRange(hsv, hsv_min, hsv_max)
                         mask = cv2.medianBlur(mask, 3)
                         veg_pixels = cv2.countNonZero(mask)
                         fcover_dict[tile_name(p)] = (veg_pixels / (non_zero_pixels / 3)) * 100 if non_zero_pixels else 0
@@ -2399,7 +2309,7 @@ class MainWindow(QMainWindow):
         df = pd.DataFrame(rows)
         out_csv = str(base / "Next.csv")
         df.to_csv(out_csv, index=False)
-        self.csv_result.setText(f"✅ Generated: Next.csv ({len(rows)} tiles)")
+        self.csv_result.setText(f"Generated: Next.csv ({len(rows)} tiles)")
         self.csv_gen_btn.setEnabled(True)
 
     # ── Cleanup ──
@@ -2649,13 +2559,7 @@ class VigorMLWindow(QDialog):
         cc_tab = QWidget()
         cc_v = QVBoxLayout(cc_tab)
         th_row = QHBoxLayout()
-        th_row.addWidget(QLabel("GNDVI threshold:"))
-        self.cc_thresh = QDoubleSpinBox()
-        self.cc_thresh.setRange(0.0, 1.0)
-        self.cc_thresh.setSingleStep(0.05)
-        self.cc_thresh.setValue(0.3)
-        th_row.addWidget(self.cc_thresh)
-        self.cc_btn = QPushButton("Compute")
+        self.cc_btn = QPushButton("Compute Canopy Cover")
         self.cc_btn.clicked.connect(self._compute_cc)
         th_row.addWidget(self.cc_btn)
         cc_v.addLayout(th_row)
@@ -2683,7 +2587,7 @@ class VigorMLWindow(QDialog):
         # Vigor Classification tab
         vc_tab = QWidget()
         vc_v = QVBoxLayout(vc_tab)
-        vc_v.addWidget(QLabel("Vigor classification based on GNDVI thresholds."))
+        vc_v.addWidget(QLabel("Vigor classification based on GNDVI."))
         self.vc_result = QLabel("—")
         vc_v.addWidget(self.vc_result)
         vc_v.addStretch()
@@ -2726,26 +2630,7 @@ class VigorMLWindow(QDialog):
         csv_sel.addWidget(self.csv_folder_lbl, 1)
         csv_v.addLayout(csv_sel)
 
-        csv_v.addWidget(QLabel("<b>Thresholds:</b>"))
-        th_grid = QGridLayout()
-        th_grid.addWidget(QLabel("GNDVI:"), 0, 0); self.csv_gndvi_th = QDoubleSpinBox(); self.csv_gndvi_th.setRange(0,1); self.csv_gndvi_th.setValue(0.4); self.csv_gndvi_th.setSingleStep(0.05); th_grid.addWidget(self.csv_gndvi_th, 0, 1)
-        th_grid.addWidget(QLabel("GRVI:"), 1, 0);  self.csv_grvi_th = QDoubleSpinBox(); self.csv_grvi_th.setRange(0,1); self.csv_grvi_th.setValue(0.18); self.csv_grvi_th.setSingleStep(0.05); th_grid.addWidget(self.csv_grvi_th, 1, 1)
-        th_grid.addWidget(QLabel("WDRVI:"), 2, 0); self.csv_wdrvi_th = QDoubleSpinBox(); self.csv_wdrvi_th.setRange(0,1); self.csv_wdrvi_th.setValue(0.6); self.csv_wdrvi_th.setSingleStep(0.05); th_grid.addWidget(self.csv_wdrvi_th, 2, 1)
-        th_grid.addWidget(QLabel("DEM slope:"), 3, 0); self.csv_dem_slope = QDoubleSpinBox(); self.csv_dem_slope.setRange(-9999,9999); self.csv_dem_slope.setValue(67.637); th_grid.addWidget(self.csv_dem_slope, 3, 1)
-        th_grid.addWidget(QLabel("DEM intercept:"), 4, 0); self.csv_dem_inter = QDoubleSpinBox(); self.csv_dem_inter.setRange(-9999,9999); self.csv_dem_inter.setValue(47.947); th_grid.addWidget(self.csv_dem_inter, 4, 1)
-        csv_v.addLayout(th_grid)
-
-        csv_v.addWidget(QLabel("<b>HSV vegetation mask:</b>"))
-        hsv_g = QGroupBox()
-        hsv_l = QGridLayout(hsv_g)
-        hsv_l.addWidget(QLabel("H:"), 0, 0); self.csv_h_min = QSpinBox(); self.csv_h_min.setRange(0,179); self.csv_h_min.setValue(27); hsv_l.addWidget(self.csv_h_min, 0, 1)
-        hsv_l.addWidget(QLabel("to"), 0, 2); self.csv_h_max = QSpinBox(); self.csv_h_max.setRange(0,179); self.csv_h_max.setValue(90); hsv_l.addWidget(self.csv_h_max, 0, 3)
-        hsv_l.addWidget(QLabel("S:"), 1, 0); self.csv_s_min = QSpinBox(); self.csv_s_min.setRange(0,255); self.csv_s_min.setValue(27); hsv_l.addWidget(self.csv_s_min, 1, 1)
-        hsv_l.addWidget(QLabel("to"), 1, 2); self.csv_s_max = QSpinBox(); self.csv_s_max.setRange(0,255); self.csv_s_max.setValue(255); hsv_l.addWidget(self.csv_s_max, 1, 3)
-        hsv_l.addWidget(QLabel("V:"), 2, 0); self.csv_v_min = QSpinBox(); self.csv_v_min.setRange(0,255); self.csv_v_min.setValue(27); hsv_l.addWidget(self.csv_v_min, 2, 1)
-        hsv_l.addWidget(QLabel("to"), 2, 2); self.csv_v_max = QSpinBox(); self.csv_v_max.setRange(0,255); self.csv_v_max.setValue(255); hsv_l.addWidget(self.csv_v_max, 2, 3)
-        csv_v.addWidget(hsv_g)
-
+        csv_v.addWidget(QLabel("Thresholds and HSV parameters are fixed."))
         self.csv_gen_btn = QPushButton("Generate CSV")
         self.csv_gen_btn.setObjectName("primary")
         self.csv_gen_btn.clicked.connect(self._csv_generate)
@@ -2814,7 +2699,7 @@ class VigorMLWindow(QDialog):
             self.cc_progress.setVisible(False)
             return
 
-        th = self.cc_thresh.value()
+        th = 0.3
         canopy = (gndvi > th).astype(float)
         pct = np.mean(canopy) * 100
         self.cc_result.setText(f"Canopy cover: {pct:.1f}%  (threshold {th:.2f})")
@@ -2872,10 +2757,15 @@ class VigorMLWindow(QDialog):
         self.csv_pbar.setVisible(True)
         self.csv_pbar.setValue(0)
 
+        vi_thresh_fixed = {"GNDVI": 0.4, "GRVI": 0.18, "WDRVI": 0.6}
+        dem_slope_fixed = 67.637
+        dem_inter_fixed = 47.947
+        hsv_min = (27, 27, 27)
+        hsv_max = (90, 255, 255)
+
         def tile_name(path):
             return Path(path).stem
 
-        # Collect all tile names
         all_tile_names = set()
         for sub in [base / "DEM", base / "dem", base / "Dem",
                     base / "GNDVI", base / "gndvi",
@@ -2891,7 +2781,6 @@ class VigorMLWindow(QDialog):
             self.csv_pbar.setVisible(False)
             return
 
-        # DEM
         self.csv_result.setText("Processing DEM…")
         QApplication.processEvents()
         height_dict = {}
@@ -2900,22 +2789,18 @@ class VigorMLWindow(QDialog):
                 for p in d.glob("*.tif"):
                     try:
                         img = np.array(Image.open(p)).astype(float)
-                        cal = self.csv_dem_slope.value() * img.mean() + self.csv_dem_inter.value()
+                        cal = dem_slope_fixed * img.mean() + dem_inter_fixed
                         height_dict[tile_name(p)] = cal
                     except Exception:
                         continue
                 break
         self.csv_pbar.setValue(25)
 
-        # Indices
         self.csv_result.setText("Processing indices…")
         QApplication.processEvents()
         vi_dir_map = {"GNDVI": [base / "GNDVI", base / "gndvi"],
                       "GRVI":  [base / "GRVI",  base / "grvi"],
                       "WDRVI": [base / "WDRVI", base / "wdrvi", base / "WRDVI", base / "wrdvi"]}
-        vi_thresh = {"GNDVI": self.csv_gndvi_th.value(),
-                     "GRVI":  self.csv_grvi_th.value(),
-                     "WDRVI": self.csv_wdrvi_th.value()}
         vi_dicts = {k: {} for k in vi_dir_map}
         for label, dirs in vi_dir_map.items():
             for d in dirs:
@@ -2928,14 +2813,13 @@ class VigorMLWindow(QDialog):
                                 vi = (raw / 65535.0) * 2.0 - 1.0
                             else:
                                 vi = raw
-                            vals = vi[vi > vi_thresh[label]]
+                            vals = vi[vi > vi_thresh_fixed[label]]
                             vi_dicts[label][tile_name(p)] = vals.mean() if vals.size > 0 else ""
                         except Exception:
                             continue
                     break
         self.csv_pbar.setValue(65)
 
-        # Optical
         self.csv_result.setText("Processing Optical…")
         QApplication.processEvents()
         fcover_dict = {}
@@ -2950,9 +2834,7 @@ class VigorMLWindow(QDialog):
                         black_pixels = np.sum(img == 0)
                         non_zero_pixels = total_pixels - black_pixels
                         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                        mask = cv2.inRange(hsv,
-                            (self.csv_h_min.value(), self.csv_s_min.value(), self.csv_v_min.value()),
-                            (self.csv_h_max.value(), self.csv_s_max.value(), self.csv_v_max.value()))
+                        mask = cv2.inRange(hsv, hsv_min, hsv_max)
                         mask = cv2.medianBlur(mask, 3)
                         veg_pixels = cv2.countNonZero(mask)
                         fcover_dict[tile_name(p)] = (veg_pixels / (non_zero_pixels / 3)) * 100 if non_zero_pixels else 0
@@ -2974,7 +2856,7 @@ class VigorMLWindow(QDialog):
         df = pd.DataFrame(rows)
         out_csv = str(base / "Next.csv")
         df.to_csv(out_csv, index=False)
-        self.csv_result.setText(f"✅ Generated: Next.csv ({len(rows)} tiles)")
+        self.csv_result.setText(f"Generated: Next.csv ({len(rows)} tiles)")
         self.csv_pbar.setVisible(False)
 
 
